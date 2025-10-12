@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional, Set, Tuple, Dict, Any
 from config import CONFIG  # externalized configuration
 import unicodedata
+import os
+from urllib.parse import urlparse
 
 try:
 	import requests
@@ -14,6 +16,10 @@ except Exception as e:
 	# Defer import error until runtime with a clear message
 	requests = None  # type: ignore
 	BeautifulSoup = None  # type: ignore
+
+# Reused HTTP session and per-host rate limiting
+SESSION = None  # type: ignore
+LAST_REQUEST_AT: Dict[str, float] = {}
 
 # CONFIG is now imported from config.py
 
@@ -29,6 +35,29 @@ USER_AGENT = (
 	"Chrome/127.0.0.0 Safari/537.36"
 )
 
+ # radius-based geocoding removed
+
+# Words that are not valid locations (avoid picking labels like 'Cena')
+BAD_LOC_WORDS = {
+	"cena", "stav", "ponuka", "nabidka", "nabídka", "kategoria", "kategória",
+	"kategorie", "predaj", "prodej",
+	# common non-location words seen in snippets (normalized comparisons)
+	"predam", "predám", "predavam", "predávam", "kupim", "kúpim", "zdravim", "ahojte",
+	"parametre", "konfiguracia", "konfigurácia", "model", "specialita",
+	"zmazat", "upravit", "topovat", "zmazať", "upraviť", "topovať",
+	"the crew", "sony", "lenovo", "hp", "dell", "gddr5", "elado", "volat", "volajte",
+}
+
+def _valid_location_text(s: Optional[str]) -> bool:
+	if not s:
+		return False
+	t = _normalize_text(s)
+	if len(t) < 3:
+		return False
+	if any(b in t for b in BAD_LOC_WORDS):
+		return False
+	return any(ch.isalpha() for ch in t)
+
 
 @dataclass
 class Listing:
@@ -37,6 +66,7 @@ class Listing:
 	price_value: Optional[int]
 	price_currency: Optional[str]
 	description: Optional[str] = None
+	location: Optional[str] = None
 
 
 def _require_deps():
@@ -46,6 +76,12 @@ def _require_deps():
 			file=sys.stderr,
 		)
 		sys.exit(1)
+	global SESSION
+	if SESSION is None:
+		try:
+			SESSION = requests.Session()
+		except Exception:
+			SESSION = requests
 
 
 def build_search_params(keyword: str, max_price: Optional[int], page: int) -> dict:
@@ -62,21 +98,165 @@ def build_search_params(keyword: str, max_price: Optional[int], page: int) -> di
 	return params
 
 
-def http_get(url: str, params: Optional[dict] = None, timeout: int = 20) -> Optional[str]:
-	headers = {"User-Agent": USER_AGENT}
-	try:
-		resp = requests.get(url, params=params, headers=headers, timeout=timeout)
-		if resp.status_code == 200:
-			return resp.text
-		else:
-			print(f"HTTP {resp.status_code} for {resp.url}", file=sys.stderr)
+def _respect_rate_limit(host: str, min_interval: float) -> None:
+	if min_interval <= 0:
+		return
+	last = LAST_REQUEST_AT.get(host)
+	if last is None:
+		return
+	elapsed = time.time() - last
+	if elapsed < min_interval:
+		sleep_for = min_interval - elapsed + random.uniform(0.05, 0.25)
+		time.sleep(max(0.0, sleep_for))
+
+
+def http_get(url: str, params: Optional[dict] = None, timeout: int = 20,
+			retries: int = 3, backoff_start: float = 5.0, backoff_max: float = 60.0,
+			min_interval: Optional[float] = None) -> Optional[str]:
+	# Use a single session and polite pacing; add backoff on 429/503
+	global SESSION
+	if SESSION is None:
+		_require_deps()
+		# _require_deps creates SESSION
+	host = urlparse(url).netloc
+	min_gap = float(CONFIG.get("request_min_interval", 2.5)) if min_interval is None else float(min_interval)
+	headers = {
+		"User-Agent": USER_AGENT,
+		"Accept-Language": "sk-SK,sk;q=0.9,cs;q=0.8,en-US;q=0.7,en;q=0.6",
+	}
+	attempt = 0
+	while True:
+		_respect_rate_limit(host, min_gap)
+		try:
+			resp = SESSION.get(url, params=params, headers=headers, timeout=timeout)
+			LAST_REQUEST_AT[host] = time.time()
+			status = resp.status_code
+			if status == 200:
+				return resp.text
+			if status in (429, 503):
+				# Rate limited or service unavailable: backoff with jitter, honor Retry-After
+				retry_after = resp.headers.get("Retry-After")
+				if retry_after:
+					try:
+						wait_s = float(retry_after)
+					except ValueError:
+						wait_s = backoff_start
+				else:
+					wait_s = min(backoff_max, backoff_start * (2 ** attempt)) + random.uniform(0.25, 0.75)
+				print(f"HTTP {status} for {resp.url} — backing off {wait_s:.1f}s", file=sys.stderr)
+				attempt += 1
+				if attempt > retries:
+					return None
+				time.sleep(wait_s)
+				continue
+			# Other non-200
+			print(f"HTTP {status} for {resp.url}", file=sys.stderr)
 			return None
-	except requests.RequestException as e:
-		print(f"Request failed: {e}", file=sys.stderr)
-		return None
+		except Exception as e:
+			print(f"Request failed: {e}", file=sys.stderr)
+			attempt += 1
+			if attempt > retries:
+				return None
+			wait_s = min(backoff_max, backoff_start * (2 ** (attempt - 1))) + random.uniform(0.1, 0.4)
+			time.sleep(wait_s)
 
 
 LISTING_HREF_RE = re.compile(r"https?://(?:[a-z0-9-]+\.)?bazos\.(sk|cz)/inzerat/\d+/.+?\.php")
+POSTAL_RE = re.compile(r"\b\d{3}\s?\d{2}\b")
+
+
+def _extract_location_near_anchor(a_tag, title_hint: Optional[str] = None) -> Optional[str]:
+	# Try to read the table row that contains the anchor; on Bazos, city is a separate line
+	def _looks_like_city(s: str) -> bool:
+		# Allow 1-3 words, each starting uppercase (diacritics ok), rest mostly lowercase
+		words = [w for w in re.split(r"\s+", s.strip()) if w]
+		if not (1 <= len(words) <= 3):
+			return False
+		for w in words:
+			if any(ch.isdigit() for ch in w):
+				return False
+			# Accept hyphens in names like "Banská Bystrica" or "Uherské Hradiště" (no hyphens, but keep simple)
+			w_clean = re.sub(r"[-'’]", "", w)
+			if not w_clean:
+				return False
+			# Title case heuristic: first char uppercase, rest not all uppercase
+			if not w_clean[0].isalpha() or not w_clean[0].isupper():
+				return False
+			rest = w_clean[1:]
+			if rest and sum(c.isupper() for c in rest) > len(rest) // 2:
+				return False
+		return True
+
+	def pick_from_text(text: str, title_norm: str) -> Optional[str]:
+		if not text:
+			return None
+		lines = [ln.strip() for ln in text.split("\n") if ln and ln.strip()]
+		# Precompute postal indices
+		postal_idx = [i for i, ln in enumerate(lines) if POSTAL_RE.search(ln)]
+		# Prefer the line next to a postal code like "010 01" (usually previous line is the city)
+		for i in postal_idx:
+			prev = lines[i - 1] if i > 0 else None
+			nxt = lines[i + 1] if (i + 1) < len(lines) else None
+			for cand in [prev, nxt]:
+				if not cand:
+					continue
+				if not _valid_location_text(cand):
+					continue
+				ln_norm = _normalize_text(cand)
+				if title_norm and (ln_norm == title_norm or title_norm in ln_norm or ln_norm in title_norm):
+					continue
+				# Prefer city-like formatting and short strings
+				if _looks_like_city(cand) and len(cand) <= 32:
+					return cand
+		# Fallback: first plausible short line that isn't a price or views
+		for idx, ln in enumerate(lines):
+			if not _valid_location_text(ln):
+				continue
+			if PRICE_RE.search(ln):
+				continue
+			# avoid lines like "257 x"
+			if re.search(r"\b\d+\s*x\b", _normalize_text(ln)):
+				continue
+			# avoid date tags like "[12.10. 2025]" or labels
+			if re.search(r"\[\d{1,2}\.\d{1,2}\.\s*\d{4}\]", ln):
+				continue
+			ln_norm = _normalize_text(ln)
+			if title_norm and (ln_norm == title_norm or title_norm in ln_norm or ln_norm in title_norm):
+				continue
+			# skip lines ending with colon/comma typical for labels or intros
+			if ln.endswith(":") or ln.endswith(","):
+				continue
+			# Heuristic: locations are short and have 0 digits
+			if len(ln) > 40 or any(ch.isdigit() for ch in ln):
+				continue
+			# If close to a postal code line, prefer it
+			if any(abs(idx - pi) <= 2 for pi in postal_idx) and _looks_like_city(ln):
+				return ln
+			# Otherwise, accept only city-like TitleCase names
+			if _looks_like_city(ln):
+				return ln
+		return None
+
+	row = a_tag.find_parent("tr")
+	if row is not None:
+		txt = row.get_text("\n", strip=True)
+		title_norm = _normalize_text(title_hint or a_tag.get_text(strip=True) or "")
+		loc = pick_from_text(txt, title_norm)
+		if loc:
+			return loc
+	# Walk up a few parents as a secondary attempt
+	container = a_tag
+	for _ in range(4):
+		parent = getattr(container, "parent", None)
+		if not parent or not getattr(parent, "get_text", None):
+			break
+		txt = parent.get_text("\n", strip=True)
+		title_norm = _normalize_text(title_hint or a_tag.get_text(strip=True) or "")
+		loc = pick_from_text(txt, title_norm)
+		if loc:
+			return loc
+		container = parent
+	return None
 
 
 def extract_listings_from_search(html: str, site: str) -> List[Listing]:
@@ -119,12 +299,16 @@ def extract_listings_from_search(html: str, site: str) -> List[Listing]:
 		# Try to find surrounding text to parse price
 		price_value, price_currency = find_price_near_anchor(a)
 
+		# Extract location near the anchor using postal code heuristic (avoid title duplication)
+		location = _extract_location_near_anchor(a, title)
+
 		listings.append(
 			Listing(
 				title=title,
 				url=href,
 				price_value=price_value,
 				price_currency=price_currency,
+				location=location,
 			)
 		)
 
@@ -180,6 +364,56 @@ def fetch_description(url: str) -> Optional[str]:
 	return max(paragraphs, key=len) if paragraphs else None
 
 
+def fetch_location(url: str) -> Optional[str]:
+	html = http_get(url)
+	if not html:
+		return None
+	soup = BeautifulSoup(html, "html.parser")
+	# 1) Labeled table fields like 'Lokalita:'
+	for td in soup.find_all("td"):
+		label = td.get_text(" ", strip=True)
+		if re.search(r"\b(lokalita|okres|kraj|mesto|mesto/obec)\b", label, re.IGNORECASE):
+			sib = td.find_next_sibling("td")
+			if sib:
+				val = sib.get_text(" ", strip=True)
+				if _valid_location_text(val):
+					return val
+	# 2) Labeled spans/divs
+	for node in soup.find_all(string=re.compile(r"\b(lokalita|okres|kraj|mesto)\b", re.IGNORECASE)):
+		parent = getattr(node, 'parent', None)
+		if not parent:
+			continue
+		sib = parent.find_next_sibling()
+		if sib:
+			val = sib.get_text(" ", strip=True)
+			if _valid_location_text(val):
+				return val
+	# 3) Regex over full text
+	full = soup.get_text("\n", strip=True)
+	m = re.search(r"(?i)Lokalita\s*:\s*([^\n\r|]+)", full)
+	if m and _valid_location_text(m.group(1)):
+		return m.group(1).strip()
+	m = re.search(r"(?i)okres\s+([A-Za-zÀ-ÿ\-\s]{2,40})", full)
+	if m and _valid_location_text(m.group(1)):
+		return m.group(1).strip()
+	# 4) Fallback: look for short plausible tokens near contact box
+	candidates: List[str] = []
+	for node in soup.select("div#wrap"):
+		try:
+			candidates.append(node.get_text("\n", strip=True))
+		except Exception:
+			pass
+	for txt in candidates:
+		for part in re.split(r"[\|\n,]", txt):
+			p = part.strip()
+			if 2 <= len(p) <= 48 and _valid_location_text(p):
+				return p
+	return None
+
+
+# geocoding removed
+
+
 def search_bazos(keyword: str, max_price: Optional[int], site: str = "sk", max_pages: int = 1,
 				 include_content: bool = False, delay_range: tuple = (0.8, 1.6)) -> List[Listing]:
 	if site not in ("sk", "cz"):
@@ -191,7 +425,7 @@ def search_bazos(keyword: str, max_price: Optional[int], site: str = "sk", max_p
 
 	for page in range(1, max_pages + 1):
 		params = build_search_params(keyword, max_price, page)
-		html = http_get(base_url, params)
+		html = http_get(base_url, params, timeout=20)
 		if not html:
 			break
 
@@ -242,7 +476,8 @@ def print_listings(listings: Iterable[Listing], as_json: bool = False) -> None:
 		count = 0
 		for l in listings:
 			price = f"{l.price_value}{l.price_currency or ''}" if l.price_value else "?"
-			line = f"- {price:>6} | {l.title} | {l.url}"
+			loc = f" | {l.location}" if l.location else ""
+			line = f"- {price:>6}{loc} | {l.title} | {l.url}"
 			print(line)
 			if l.description:
 				# Print a short preview
@@ -253,6 +488,58 @@ def print_listings(listings: Iterable[Listing], as_json: bool = False) -> None:
 			count += 1
 		if count == 0:
 			print("No listings found under the given criteria.")
+
+
+def telegram_enabled() -> bool:
+	return bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+
+
+def telegram_send_message(text: str) -> None:
+	token = os.getenv("TELEGRAM_BOT_TOKEN")
+	chat_id = os.getenv("TELEGRAM_CHAT_ID")
+	if not token or not chat_id:
+		return
+	try:
+		import requests as _rq
+		url = f"https://api.telegram.org/bot{token}/sendMessage"
+		payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+		_rq.post(url, json=payload, timeout=10)
+	except Exception as e:
+		print(f"Telegram send failed: {e}", file=sys.stderr)
+
+
+def telegram_send_chunks(text: str, chunk_size: int = 3800) -> None:
+	# Telegram max length ~4096; keep margin
+	s = text.strip()
+	while s:
+		if len(s) <= chunk_size:
+			telegram_send_message(s)
+			break
+		cut = s.rfind("\n", 0, chunk_size)
+		if cut == -1 or cut < chunk_size // 2:
+			cut = chunk_size
+		telegram_send_message(s[:cut].rstrip())
+		s = s[cut:].lstrip()
+
+
+def load_env_file(path: str = ".env") -> None:
+	try:
+		if not os.path.isfile(path):
+			return
+		with open(path, "r", encoding="utf-8") as f:
+			for line in f:
+				line = line.strip()
+				if not line or line.startswith("#"):
+					continue
+				if "=" not in line:
+					continue
+				k, v = line.split("=", 1)
+				k = k.strip()
+				v = v.strip().strip('"').strip("'")
+				if k and (k not in os.environ):
+					os.environ[k] = v
+	except Exception as e:
+		print(f"Failed to load {path}: {e}", file=sys.stderr)
 
 
 def set_interval(seconds: int) -> None:
@@ -309,7 +596,23 @@ def matches_query(lst: Listing, query: str, mode: str = "title") -> bool:
 	return (q in title_norm) or (bool(desc_norm) and q in desc_norm)
 
 
-def load_json_file(path: str) -> Optional[Dict[str, Any]]:
+def _city_match(location_text: Optional[str], include: List[str], exclude: List[str]) -> bool:
+	loc = _normalize_text(location_text)
+	inc = [_normalize_text(x) for x in (include or []) if isinstance(x, str)]
+	exc = [_normalize_text(x) for x in (exclude or []) if isinstance(x, str)]
+	# If include provided, require at least one include token be present
+	if inc:
+		if not loc or not any(token and token in loc for token in inc):
+			return False
+	# Exclude wins if any token matches
+	if exc and loc and any(token and token in loc for token in exc):
+		return False
+	return True
+
+
+def load_json_file(path: Optional[str]) -> Optional[Dict[str, Any]]:
+	if not path:
+		return None
 	try:
 		import json
 		with open(path, "r", encoding="utf-8") as f:
@@ -321,7 +624,10 @@ def load_json_file(path: str) -> Optional[Dict[str, Any]]:
 		return None
 
 
-def save_json_file(path: str, data: Dict[str, Any]) -> None:
+def save_json_file(path: Optional[str], data: Dict[str, Any]) -> None:
+	if not path:
+		# No-op when state file path is disabled
+		return
 	try:
 		import json
 		with open(path, "w", encoding="utf-8") as f:
@@ -330,8 +636,8 @@ def save_json_file(path: str, data: Dict[str, Any]) -> None:
 		print(f"Failed to write {path}: {e}", file=sys.stderr)
 
 
-def ensure_state(path: str) -> Dict[str, Any]:
-	state = load_json_file(path)
+def ensure_state(path: Optional[str]) -> Dict[str, Any]:
+	state = load_json_file(path) if path else None
 	if not isinstance(state, dict):
 		state = {"seen": {}}
 	if "seen" not in state or not isinstance(state["seen"], dict):
@@ -365,7 +671,17 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 	if not isinstance(searches, list) or not searches:
 		print("Config has no searches[]", file=sys.stderr)
 		return
-	for s in searches:
+	# Shuffle searches to distribute load patterns
+	_shuffled = list(searches)
+	random.shuffle(_shuffled)
+	# Read pacing config
+	gap_range = config.get("search_gap_range") or (7.0, 15.0)
+	if not (isinstance(gap_range, (list, tuple)) and len(gap_range) == 2):
+		gap_range = (7.0, 15.0)
+	req_delay_range = config.get("request_delay_range") or (1.2, 2.4)
+	if not (isinstance(req_delay_range, (list, tuple)) and len(req_delay_range) == 2):
+		req_delay_range = (1.2, 2.4)
+	for idx, s in enumerate(_shuffled):
 		if not isinstance(s, dict):
 			continue
 		keyword = str(s.get("keyword", "")).strip()
@@ -385,7 +701,7 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 			site=site,
 			max_pages=max(1, pages),
 			include_content=include_content,
-			delay_range=(0.8, 1.6),
+			delay_range=tuple(req_delay_range),
 		)
 		# Match scope: title / description / both
 		match_in = str(s.get("match_in", "title")).lower()
@@ -398,32 +714,53 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 					lst.description = fetch_description(lst.url)
 		# Apply query matching filter
 		listings = [l for l in listings if matches_query(l, keyword, match_in)]
-		# Resolve ignore patterns: global + per-search
-		ignore_patterns: List[str] = []
-		if isinstance(config.get("ignore"), list):
-			ignore_patterns.extend([str(x) for x in config.get("ignore", [])])
-		if isinstance(s.get("ignore"), list):
-			ignore_patterns.extend([str(x) for x in s.get("ignore", [])])
-		if ignore_patterns:
-			listings = [l for l in listings if not matches_ignore(l, ignore_patterns)]
+		# Optional: city filter from CONFIG
+		cities_cfg = config.get("cities") or {}
+		include_cities = cities_cfg.get("include") if isinstance(cities_cfg, dict) else None
+		exclude_cities = cities_cfg.get("exclude") if isinstance(cities_cfg, dict) else None
+
+		# Prefer include/exclude textual filtering when provided
+		if (include_cities or exclude_cities):
+			filtered_text: List[Listing] = []
+			for lst in listings:
+				# Always fetch detail-location to avoid snippet labels like 'Cena'
+				time.sleep(random.uniform(0.2, 0.5))
+				loc = fetch_location(lst.url)
+				if loc:
+					lst.location = loc
+				if _city_match(lst.location, include_cities or [], exclude_cities or []):
+					filtered_text.append(lst)
+			listings = filtered_text
+		# No radius fallback; radius filtering removed
 		key = f"{site}:{keyword}:{max_price}:{pages}:{include_content}"
 		new_listings = dedupe_new(listings, state, key)
 		if new_listings:
 			print(f"\n=== New listings for '{keyword}' ({site}, <= {max_price}) ===")
 			print_listings(new_listings, as_json=False)
-			# Save state after each search to avoid loss
-			save_json_file(state_path, state)
+			# Telegram summary (optional, single message)
+			if telegram_enabled():
+				lines = [f"New {keyword} ({site} <= {max_price}): {len(new_listings)} item(s)"]
+				for l in new_listings:
+					price = f"{l.price_value}{l.price_currency or ''}" if l.price_value else "?"
+					loc = f" {l.location}" if l.location else ""
+					lines.append(f"- {price}{loc} | {l.title}\n{l.url}")
+				telegram_send_chunks("\n".join(lines))
 		else:
-			print(f"No new listings for '{keyword}' ({site}, <= {max_price}).")
-
-
+			print(f"\n No new listings for '{keyword}' ({site}, <= {max_price}).")
+		# Polite pause between searches
+		if idx < len(_shuffled) - 1:
+			time.sleep(random.uniform(*gap_range))
 def main() -> int:
 	_require_deps()
+	# Load .env for TELEGRAM_*/LOCATION_* if present
+	load_env_file()
 	config = CONFIG
 	interval = int(config.get("interval", 300))
-	# Use default state file if config provides None or empty
+	# If state_file is None, persistence is disabled (no read/write)
 	state_path = config.get("state_file")
 	state = ensure_state(state_path)
+
+    # No LOCATION_* env; radius filtering removed
 
 	# Decide whether to run once or watch based on config
 	watch = bool(config.get("watch", False))
@@ -444,4 +781,3 @@ def main() -> int:
 
 if __name__ == "__main__":
 	sys.exit(main())
-

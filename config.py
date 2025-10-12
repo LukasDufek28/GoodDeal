@@ -6,12 +6,13 @@ CONFIG: Dict[str, Any] = {
     "watch": False,          # set to True to run forever
     "interval": 5*60,         # seconds between checks in watch mode
     "state_file": None,      # ".bazos_state.json" default state file
-    # Ignore patterns (accent-insensitive). Listings with these substrings
-    # in the title or description will be skipped. Example: ["kupim", "hledam"].
+    "cities": {
+        # "include": [""bratislava"],
+        # "exclude": ["trnava"],
+    },
     "ignore": [
         "kupim",  # uncomment to ignore "Kúpim / Kúpil by som" etc.
     ],
-    # List of searches to perform each cycle
     "searches": [
         # 🔹 GPUs (always hot & liquid)
         {"keyword": "rtx 3060", "max_price": 150, "site": "sk", "pages": 2, "include_content": False, "match_in": "title"},

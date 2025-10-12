@@ -1,3 +1,4 @@
 /.bazos_state.json
 /.venv
+/.env
 /__pycache__
