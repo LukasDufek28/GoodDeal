@@ -259,7 +259,7 @@ def _extract_location_near_anchor(a_tag, title_hint: Optional[str] = None) -> Op
 	return None
 
 
-def extract_listings_from_search(html: str, site: str) -> List[Listing]:
+def extract_listings_from_search(html: str, site: str, max_price: Optional[int] = None) -> List[Listing]:
 	soup = BeautifulSoup(html, "html.parser")
 
 	anchors = soup.find_all("a", href=True)
@@ -296,8 +296,8 @@ def extract_listings_from_search(html: str, site: str) -> List[Listing]:
 			if m:
 				slug = m.group(1)
 				title = slug.replace("-", " ")
-		# Try to find surrounding text to parse price
-		price_value, price_currency = find_price_near_anchor(a)
+		# Try to find surrounding text to parse price (robust selection)
+		price_value, price_currency = find_price_near_anchor(a, max_price=max_price, site=site)
 
 		# Extract location near the anchor using postal code heuristic (avoid title duplication)
 		location = _extract_location_near_anchor(a, title)
@@ -319,27 +319,63 @@ PRICE_RE = re.compile(
 	r"(?P<value>\d{1,3}(?:[\u00A0\s]\d{3})*|\d+)(?:[\.,]\d{2})?\s*(?P<cur>€|eur|eura|Kč)",
 	re.IGNORECASE,
 )
+SHIPPING_HINT_RE = re.compile(r"(?i)\b(postovne|poštovne|doprava|zaslanie|zasielka|odber|dobierka|kurier|kuriér|shipping|posta|pošta|osobny odber|osobný odber)\b")
 
 
-def find_price_near_anchor(a_tag) -> Tuple[Optional[int], Optional[str]]:
-	# Walk up to a reasonable container and inspect its text
+def _parse_price_match(m: re.Match) -> Tuple[Optional[int], Optional[str]]:
+	value_raw = m.group("value").replace("\u00A0", " ").replace(" ", "")
+	try:
+		value = int(value_raw.replace(",", ".").split(".")[0])
+	except ValueError:
+		value = None
+	cur = m.group("cur")
+	cur = "€" if isinstance(cur, str) and cur.lower() in ("eur", "eura") else cur
+	return value, cur
+
+
+def find_price_near_anchor(a_tag, max_price: Optional[int] = None, site: str = "sk") -> Tuple[Optional[int], Optional[str]]:
+	# Walk up to a reasonable container and inspect its text; collect multiple candidates
+	candidates: List[Tuple[int, str, float]] = []  # (value, currency, score)
 	container = a_tag
-	for _ in range(4):
-		if container.parent is None:
+	depth = 0
+	while container is not None and depth < 4:
+		parent = getattr(container, "parent", None)
+		if parent is None:
 			break
-		container = container.parent
+		container = parent
 		text = container.get_text(" ", strip=True)
-		m = PRICE_RE.search(text)
-		if m:
-			value_raw = m.group("value").replace("\u00A0", " ").replace(" ", "")
-			try:
-				value = int(value_raw.replace(",", ".").split(".")[0])
-			except ValueError:
-				value = None
-			cur = m.group("cur")
-			cur = "€" if cur.lower() in ("eur", "eura") else cur
-			return value, cur
-	return None, None
+		if not text:
+			depth += 1
+			continue
+		# Find all price occurrences in this text block
+		for m in PRICE_RE.finditer(text):
+			val, cur = _parse_price_match(m)
+			if val is None:
+				continue
+			# currency sanity per site
+			if site == "sk" and cur not in ("€", None, "eur", "eura"):
+				continue
+			if site == "cz" and cur not in ("Kč", None):
+				continue
+			# score baseline by value (prefer higher, assuming item price > shipping)
+			score = float(val)
+			# penalize if shipping-related words are near the match window
+			window_start = max(0, m.start() - 25)
+			window_end = min(len(text), m.end() + 25)
+			window = text[window_start:window_end]
+			if SHIPPING_HINT_RE.search(window):
+				score *= 0.25
+			# if max_price is provided and this is extremely low (< 70% of max), penalize hard
+			if max_price is not None and val < 0.7 * max_price:
+				score *= 0.5
+			candidates.append((val, ("€" if (cur and str(cur).lower() in ("eur", "eura")) else (cur or ("€" if site == "sk" else "Kč"))), score))
+		depth += 1
+	if not candidates:
+		return None, None
+	# Choose the highest score; this typically selects the actual item price over shipping
+	candidates.sort(key=lambda t: t[2], reverse=True)
+	best_val, best_cur, _ = candidates[0]
+	return best_val, best_cur
 
 
 def fetch_description(url: str) -> Optional[str]:
@@ -429,7 +465,7 @@ def search_bazos(keyword: str, max_price: Optional[int], site: str = "sk", max_p
 		if not html:
 			break
 
-		page_listings = extract_listings_from_search(html, site)
+		page_listings = extract_listings_from_search(html, site, max_price=max_price)
 		if not page_listings:
 			# No more results
 			break
@@ -714,6 +750,10 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 					lst.description = fetch_description(lst.url)
 		# Apply query matching filter
 		listings = [l for l in listings if matches_query(l, keyword, match_in)]
+		# Apply ignore patterns (accent-insensitive) on title/description
+		ignore_patterns = config.get("ignore") or []
+		if isinstance(ignore_patterns, list) and ignore_patterns:
+			listings = [l for l in listings if not matches_ignore(l, ignore_patterns)]
 		# Optional: city filter from CONFIG
 		cities_cfg = config.get("cities") or {}
 		include_cities = cities_cfg.get("include") if isinstance(cities_cfg, dict) else None
