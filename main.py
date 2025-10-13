@@ -5,6 +5,8 @@ import random
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Set, Tuple, Dict, Any
 from config import CONFIG  # externalized configuration
+from db import ensure_db, insert_listing
+from gui import review_listings
 import unicodedata
 import os
 from urllib.parse import urlparse
@@ -777,6 +779,26 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 		if new_listings:
 			print(f"\n=== New listings for '{keyword}' ({site}, <= {max_price}) ===")
 			print_listings(new_listings, as_json=False)
+			# Optionally review in GUI and save accepted items to sqlite
+			try:
+				if bool(config.get("gui")):
+					# Prepare DB
+					db_path = config.get("db_file") or "gooddeal.db"
+					ensure_db(db_path)
+					# Pack listings for GUI: include description as last element
+					gui_input = [(
+						l.title,
+						l.url,
+						l.price_value,
+						l.price_currency,
+						l.location,
+						l.description,
+					) for l in new_listings]
+					accepted = review_listings(gui_input)
+					for title, url, price_val, cur, loc in accepted:
+						insert_listing(db_path, title, url, loc, price_val, cur)
+			except Exception as e:
+				print(f"GUI/DB processing failed: {e}", file=sys.stderr)
 			# Telegram summary (optional, single message)
 			if telegram_enabled():
 				lines = [f"New {keyword} ({site} <= {max_price}): {len(new_listings)} item(s)"]

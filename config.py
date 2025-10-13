@@ -50,4 +50,8 @@ CONFIG: Dict[str, Any] = {
         {"keyword": "iphone 11", "max_price": 180, "site": "sk", "pages": 2, "include_content": False, "match_in": "title"},
         {"keyword": "samsung s20", "max_price": 170, "site": "sk", "pages": 2, "include_content": False, "match_in": "title"},
     ],
+    # GUI review: when True, new listings will be shown in a simple Tkinter review window
+    "gui": True,
+    # SQLite DB file to store accepted listings
+    "db_file": "gooddeal.db",
 }
