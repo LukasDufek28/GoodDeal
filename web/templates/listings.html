@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GoodDeal Listings</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <h2>GoodDeal Listings</h2>
+    {% if msg %}
+      <div class="msg {{ 'err' if err else '' }}">{{ msg }}</div>
+    {% endif %}
+
+    <div class="controls">
+      <form method="get" class="inline-form">
+        <input type="text" name="q" placeholder="Search in title/description" value="{{ q|e }}" class="inp-wide">
+        <input type="number" name="min" placeholder="Min price" value="{{ min or '' }}" class="inp-sm">
+        <input type="number" name="max" placeholder="Max price" value="{{ max or '' }}" class="inp-sm">
+        <input type="number" name="limit" placeholder="Limit" value="{{ limit }}" class="inp-xs">
+        <button type="submit" class="btn">Filter</button>
+        <a id="export-link" class="link" href="{{ url_for('export_text') }}?q={{ q|e }}&min={{ min or '' }}&max={{ max or '' }}&limit={{ limit }}">Export text</a>
+      </form>
+
+      <form method="post" action="{{ url_for('clear') }}" class="inline-form" onsubmit="return confirm('Type DELETE in the box to confirm.');">
+        <input type="text" name="confirm" placeholder="Type DELETE to confirm" class="inp-confirm">
+        <button type="submit" class="btn btn-danger">Clear DB</button>
+      </form>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th class="col-title">Title</th>
+            <th class="col-price">Price</th>
+            <th class="col-loc">Location</th>
+            <th class="col-url">URL</th>
+            <th class="col-desc">Description</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for t, u, pv, pc, d, loc in rows %}
+          <tr>
+            <td class="wrap">{{ t }}</td>
+            <td class="mono">{{ format_price(pv, pc) }}</td>
+            <td class="wrap">{{ loc or '—' }}</td>
+            <td class="wrap"><a href="{{ u }}" target="_blank" rel="noopener">{{ u }}</a></td>
+            <td class="wrap">{{ d or '—' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+  // Intercept Export text; copy to clipboard, then open ChatGPT
+  (function () {
+    const link = document.getElementById('export-link');
+    if (!link) return;
+    link.addEventListener('click', async function (e) {
+      e.preventDefault();
+      try {
+        const res = await fetch(link.href, { headers: { 'Accept': 'text/plain' } });
+        if (!res.ok) throw new Error('Failed to fetch export');
+        const text = await res.text();
+
+        // Try modern clipboard API first, fallback to execCommand
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.left = '-9999px';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+        }
+
+        const w = window.open('https://chatgpt.com/?temporary-chat=true', '_blank');
+        if (w) w.opener = null;
+      } catch (err) {
+        alert('Failed to copy export text. Please try again.');
+      }
+    });
+  })();
+  </script>
+</body>
+</html>

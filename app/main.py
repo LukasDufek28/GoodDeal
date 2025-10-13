@@ -7,6 +7,7 @@ from config import CONFIG  # externalized configuration
 import unicodedata
 import os
 from urllib.parse import urlparse, urljoin
+from gui import review_listings
 
 try:
 	import requests
@@ -172,9 +173,23 @@ def format_price_for_display(value: Optional[int], currency: Optional[str]) -> s
 	return f"{num} {currency}" if currency else num
 
 def render_listings(listings: List[Listing]) -> str:
-	lines: List[str] = []
+	rows: List[tuple[str, str, str, str]] = []
 	for l in listings:
-		lines.append(f"{l.title} | Price: {format_price_for_display(l.price_value, l.price_currency)} | Location: {l.location or '-'}| Link: {l.url or '-'}")
+		rows.append((
+			l.title or "",
+			format_price_for_display(l.price_value, l.price_currency),
+			(l.location or "-"),
+			(l.url or "-"),
+		))
+	if not rows:
+		return ""
+	w_title = max(len(r[0]) for r in rows)
+	w_price = max(len(r[1]) for r in rows)
+	w_loc = max(len(r[2]) for r in rows)
+	lines: List[str] = []
+	for title, price, loc, url in rows:
+		# title and location left-aligned; price right-aligned
+		lines.append(f"{title.ljust(w_title)}  |  {price.rjust(w_price)}  |  {loc.ljust(w_loc)}  |  {url}")
 	return "\n".join(lines)
 
 def dedupe_listings(listings: List[Listing]) -> List[Listing]:
@@ -217,3 +232,5 @@ for s in searches:
 	print(header)
 	print(render_listings(results))
 	print()
+	# Open minimal GUI to approve/decline and save to DB
+	review_listings(results, auto_open=True)
