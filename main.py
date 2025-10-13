@@ -5,7 +5,7 @@ import random
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Set, Tuple, Dict, Any
 from config import CONFIG  # externalized configuration
-from db import ensure_db, insert_listing
+from db import ensure_db, insert_listing, insert_listing_with_details
 from gui import review_listings
 import unicodedata
 import os
@@ -86,7 +86,7 @@ def _require_deps():
 			SESSION = requests
 
 
-def build_search_params(keyword: str, max_price: Optional[int], page: int) -> dict:
+def build_search_params(keyword: str, max_price: Optional[int], page: int, min_price: Optional[int] = None) -> dict:
 	params = {
 		"hledat": keyword,
 		"rubriky": "0",  # search all sections (we'll post-filter to pc)
@@ -97,6 +97,24 @@ def build_search_params(keyword: str, max_price: Optional[int], page: int) -> di
 	}
 	if max_price is not None:
 		params["cenado"] = str(max_price)
+	if min_price is not None:
+		params["cenaod"] = str(min_price)
+	# Optional region filter via environment or CONFIG
+	try:
+		hlok_env = os.getenv("HLOKALITA")
+		hlok_cfg = CONFIG.get("hlokalita") if isinstance(CONFIG, dict) else None
+		hlok = (hlok_env if hlok_env is not None else (str(hlok_cfg) if hlok_cfg is not None else "")).strip()
+		if hlok:
+			# Normalize '+' to space in case value is pasted as '811+01'
+			params["hlokalita"] = hlok.replace("+", " ")
+			hum_env = os.getenv("HUMKREIS")
+			hum_cfg = CONFIG.get("humkreis") if isinstance(CONFIG, dict) else None
+			hum = (hum_env if hum_env is not None else (str(hum_cfg) if hum_cfg is not None else "")).strip()
+			if hum:
+				params["humkreis"] = hum
+	except Exception:
+		# Non-fatal if env/config parsing fails
+		pass
 	return params
 
 
@@ -453,7 +471,7 @@ def fetch_location(url: str) -> Optional[str]:
 
 
 def search_bazos(keyword: str, max_price: Optional[int], site: str = "sk", max_pages: int = 1,
-				 include_content: bool = False, delay_range: tuple = (0.8, 1.6)) -> List[Listing]:
+				 include_content: bool = False, delay_range: tuple = (0.8, 1.6), min_price: Optional[int] = None) -> List[Listing]:
 	if site not in ("sk", "cz"):
 		raise ValueError("site must be 'sk' or 'cz'")
 
@@ -462,7 +480,7 @@ def search_bazos(keyword: str, max_price: Optional[int], site: str = "sk", max_p
 	seen_urls: Set[str] = set()
 
 	for page in range(1, max_pages + 1):
-		params = build_search_params(keyword, max_price, page)
+		params = build_search_params(keyword, max_price, page, min_price=min_price)
 		html = http_get(base_url, params, timeout=20)
 		if not html:
 			break
@@ -472,32 +490,30 @@ def search_bazos(keyword: str, max_price: Optional[int], site: str = "sk", max_p
 			# No more results
 			break
 
-		# Filter price if we couldn't parse it from snippet (since 'cenado' is already applied, this is a safety)
 		filtered: List[Listing] = []
 		for lst in page_listings:
 			if lst.url in seen_urls:
 				continue
 			seen_urls.add(lst.url)
-			if max_price is not None and lst.price_value is not None:
+			if lst.price_value is not None:
 				# Respect currency per site
 				if site == "sk" and (lst.price_currency not in ("€", None)):
-					# Skip mismatched currency when parsed
 					continue
 				if site == "cz" and (lst.price_currency not in ("Kč", None)):
 					continue
-				if lst.price_value > max_price:
+				# Apply min/max price bounds when parsed
+				if max_price is not None and lst.price_value > max_price:
+					continue
+				if min_price is not None and lst.price_value < min_price:
 					continue
 			filtered.append(lst)
 
 		if include_content:
 			for lst in filtered:
-				# Be polite with rate limiting
 				time.sleep(random.uniform(*delay_range))
 				lst.description = fetch_description(lst.url)
 
 		all_listings.extend(filtered)
-
-		# Rate limiting between pages
 		time.sleep(random.uniform(*delay_range))
 
 	return all_listings
@@ -709,9 +725,22 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 	if not isinstance(searches, list) or not searches:
 		print("Config has no searches[]", file=sys.stderr)
 		return
-	# Shuffle searches to distribute load patterns
-	_shuffled = list(searches)
-	random.shuffle(_shuffled)
+
+	# Order searches by ascending min_price (lowest first), then by max_price
+	def _to_int(val, default):
+		try:
+			return int(val)
+		except Exception:
+			return default
+
+	_ordered = sorted(
+		[s for s in searches if isinstance(s, dict)],
+		key=lambda s: (
+			_to_int(s.get("min_price"), 0),
+			_to_int(s.get("max_price"), 10**9),
+		),
+	)
+
 	# Read pacing config
 	gap_range = config.get("search_gap_range") or (7.0, 15.0)
 	if not (isinstance(gap_range, (list, tuple)) and len(gap_range) == 2):
@@ -719,7 +748,8 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 	req_delay_range = config.get("request_delay_range") or (1.2, 2.4)
 	if not (isinstance(req_delay_range, (list, tuple)) and len(req_delay_range) == 2):
 		req_delay_range = (1.2, 2.4)
-	for idx, s in enumerate(_shuffled):
+
+	for idx, s in enumerate(_ordered):
 		if not isinstance(s, dict):
 			continue
 		keyword = str(s.get("keyword", "")).strip()
@@ -730,6 +760,10 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 			max_price = int(s.get("max_price")) if s.get("max_price") is not None else None
 		except Exception:
 			max_price = None
+		try:
+			min_price = int(s.get("min_price")) if s.get("min_price") is not None else None
+		except Exception:
+			min_price = None
 		pages = int(s.get("pages", 2))
 		include_content = bool(s.get("include_content", False))
 
@@ -740,6 +774,7 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 			max_pages=max(1, pages),
 			include_content=include_content,
 			delay_range=tuple(req_delay_range),
+			min_price=min_price,
 		)
 		# Match scope: title / description / both
 		match_in = str(s.get("match_in", "title")).lower()
@@ -774,7 +809,7 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 					filtered_text.append(lst)
 			listings = filtered_text
 		# No radius fallback; radius filtering removed
-		key = f"{site}:{keyword}:{max_price}:{pages}:{include_content}"
+		key = f"{site}:{keyword}:{min_price}:{max_price}:{pages}:{include_content}"
 		new_listings = dedupe_new(listings, state, key)
 		if new_listings:
 			print(f"\n=== New listings for '{keyword}' ({site}, <= {max_price}) ===")
@@ -785,7 +820,19 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 					# Prepare DB
 					db_path = config.get("db_file") or "gooddeal.db"
 					ensure_db(db_path)
-					# Pack listings for GUI: include description as last element
+					# Guess a default type from the keyword (can be overridden in GUI)
+					def _guess_type(s: str) -> str:
+						s2 = _normalize_text(s)
+						if any(tok in s2 for tok in ("rtx", "gtx", "rx ", "gpu", "grafika", "graphics")):
+							return "gpu"
+						if "iphone" in s2 or "apple iphone" in s2:
+							return "iphone"
+						if any(tok in s2 for tok in ("ps5", "playstation", "xbox", "switch", "steam deck")):
+							return "console"
+						if any(tok in s2 for tok in ("macbook", "ipad", "airpods", "apple watch")):
+							return "apple"
+						return "other"
+					# Pack listings for GUI: include description, guessed type, and placeholder for rating
 					gui_input = [(
 						l.title,
 						l.url,
@@ -793,10 +840,25 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 						l.price_currency,
 						l.location,
 						l.description,
+						_guess_type(keyword),
+						None,  # rating to be filled in GUI
 					) for l in new_listings]
 					accepted = review_listings(gui_input)
-					for title, url, price_val, cur, loc in accepted:
-						insert_listing(db_path, title, url, loc, price_val, cur)
+					for title, url, price_val, cur, loc, type_val, rating_val in accepted:
+						# Route to category tables with product_name (keyword) and rating
+						insert_listing_with_details(
+							db_path,
+							title=title,
+							url=url,
+							location=loc,
+							price=price_val,
+							currency=cur,
+							type_=type_val,
+							product_name=keyword,
+							listing_title=title,
+							rating=rating_val,
+							params_json=None,
+						)
 			except Exception as e:
 				print(f"GUI/DB processing failed: {e}", file=sys.stderr)
 			# Telegram summary (optional, single message)
@@ -810,7 +872,7 @@ def run_config_cycle(config: Dict[str, Any], state: Dict[str, Any], state_path: 
 		else:
 			print(f"\n No new listings for '{keyword}' ({site}, <= {max_price}).")
 		# Polite pause between searches
-		if idx < len(_shuffled) - 1:
+		if idx < len(_ordered) - 1:
 			time.sleep(random.uniform(*gap_range))
 def main() -> int:
 	_require_deps()
